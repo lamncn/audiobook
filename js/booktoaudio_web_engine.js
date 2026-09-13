@@ -1027,21 +1027,23 @@
       return (function() {
         if (!window.wteBlocks) return '{}';
 
-        const getSafeSelector = (el) => {
-          if (el.id && !el.id.match(/\d+/) && !el.id.includes('aswift')) return '#' + el.id;
-          if (el.className && typeof el.className === 'string') {
-            const classes = el.className.split(/\s+/).filter(c => c && !c.startsWith('wte-') && !c.includes(':'));
-            if (classes.length > 0) return el.tagName.toLowerCase() + '.' + classes.join('.');
+        // Utility classes may contain '/', '[', '.', ':' or quotes. Match each
+        // complete class token as a CSS string instead of treating it as syntax.
+        const cssString = value => String(value).replace(/[\x00-\x1f\x7f"\\]/g,
+          char => '\\' + char.charCodeAt(0).toString(16) + ' ');
+        const ownSelector = el => {
+          if (el.id && !el.id.match(/\d+/) && !el.id.includes('aswift')) {
+            return '[id="' + cssString(el.id) + '"]';
           }
+          const classes = Array.from(el.classList).filter(c => !c.startsWith('wte-'));
+          return classes.length ? el.tagName.toLowerCase() + classes.map(c =>
+            '[class~="' + cssString(c) + '"]').join('') : '';
+        };
+        const getSafeSelector = (el) => {
+          const own = ownSelector(el);
+          if (own) return own;
           if (el.parentElement) {
-            const parent = el.parentElement;
-            let parentSel = '';
-            if (parent.id && !parent.id.match(/\d+/) && !parent.id.includes('aswift')) {
-              parentSel = '#' + parent.id;
-            } else if (parent.className && typeof parent.className === 'string') {
-              const pClasses = parent.className.split(/\s+/).filter(c => c && !c.startsWith('wte-') && !c.includes(':'));
-              if (pClasses.length > 0) parentSel = parent.tagName.toLowerCase() + '.' + pClasses.join('.');
-            }
+            const parentSel = ownSelector(el.parentElement);
             if (parentSel) return parentSel + ' > ' + el.tagName.toLowerCase();
           }
           return el.tagName.toLowerCase();
