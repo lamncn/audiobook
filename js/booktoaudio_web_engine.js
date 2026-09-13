@@ -22,7 +22,8 @@
   // Null/missing host roots must wait, never treat a toolbar as chapter content.
   const siteAdapters = [
     {
-      matches: hostname => hostname === 'truyendich.space' || hostname.endsWith('.truyendich.space'),
+      matches: hostname => ['truyendich.space', 'truyendich.fit'].some(domain =>
+        hostname === domain || hostname.endsWith('.' + domain)),
       rootSelectors: ['#original-content-tab'],
       getTitle: ({ root, readText }) => {
         const article = root && root.closest('article');
@@ -143,9 +144,13 @@
       }).join('') : /^(null|undefined)$/.test(normalizeText(rawText)) ? '' : normalizeText(rawText);
       if (context.adapter.format) text = context.adapter.format({ ...context, blocks: selected, rawText, text });
       text = normalizeText(text);
+      const reviewedTitleBlock = rawText == null && blocks == null && context.root && Array.isArray(window.wteBlocks)
+        ? window.wteBlocks.find(block => block.selected && block.element && !context.root.contains(block.element))
+        : null;
+      const reviewedTitle = reviewedTitleBlock ? normalizeText(reviewedTitleBlock.text) : '';
       const heading = rawText == null && selected.find(block => block.type === 'heading' || /^h[1-6]$/.test(block.type));
       const title = !text ? '' : rawText != null ? firstLineTitle(text)
-        : (heading && normalizeText(heading.text)) || (blocks == null && chapterTitle(context)) || firstLineTitle(text);
+        : (heading && normalizeText(heading.text)) || reviewedTitle || (blocks == null && chapterTitle(context)) || firstLineTitle(text);
       return JSON.stringify({ text, title, url: context.url });
     },
     configureExtraction: function ({ removeSelectors = [], automation = false } = {}) {
