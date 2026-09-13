@@ -2,8 +2,159 @@
 // Native popup/login policy and Flutter channels remain owned by the app.
 (function () {
   'use strict';
+  // Extension convention: edit this registry in the published JS; do not add
+  // per-site rules in Dart. Entries are checked in order, before generic fallback.
+  // No callback runs at installation. All hooks are synchronous, with context:
+  // {document, window, root, adapter, url, readText(element, {signature:false})}.
+  // Entry interface (only matches is required):
+  // matches(hostname): boolean; rootSelectors: string[] (ordered alternatives);
+  // getRoot(context): Element|null (overrides rootSelectors);
+  // titleSelectors: string[] (relative to root); getTitle(context): string;
+  // nextSelectors: string[]; getNext(context): Element[] (forward controls only);
+  // isReady(context): boolean (additional gate; nonempty/stable still required);
+  // getSignatureText(context): string (chapter body only, never URL/title);
+  // getBlocks(context): {element:Element,text:string,type:string}[] (optional
+  // replacement for generic DOM traversal, keeping real elements for selection);
+  // autoSelect(block, context): boolean; format({blocks,rawText,text,...context}):
+  // string. format must respect explicit rawText and selected:false (blocks passed
+  // here are already filtered). Never use unrelated DOM titles for rawText.
+  // Hooks own arbitrary site markup, not native permissions, I/O or navigation.
+  // Null/missing host roots must wait, never treat a toolbar as chapter content.
+  const siteAdapters = [
+    {
+      matches: hostname => hostname === 'truyendich.space' || hostname.endsWith('.truyendich.space'),
+      rootSelectors: ['#original-content-tab'],
+      getTitle: ({ root, readText }) => {
+        const article = root && root.closest('article');
+        return readText(article && article.querySelector('header h1[itemprop="name"], header h1'));
+      },
+      nextSelectors: ['a[aria-label="Chương sau"]', 'a[rel~="next"]'],
+      isReady: ({ root }) => !!root && !root.closest('[aria-busy="true"]'),
+      autoSelect: () => true,
+    },
+  ];
+  const genericAdapter = { rootSelectors: ['article', 'main', '[role="main"]'], nextSelectors: ['a[rel~="next"]'] };
+  let extractionOptions = { automation: false };
+  let stableSignature = null;
+  let stableSince = 0;
+  let resetHeld = false;
+  let previousKey = null;
+  const contentNoise = 'script, style, noscript, iframe, svg, canvas, nav, aside, footer, button, select, input, textarea, [role="toolbar"], .toolbar, .adsbygoogle, [class*="ad-container"], [class*="advert"], [id*="google_ads"], #wte-overlay, #wte-styles, #wte-picker-style';
+  const normalizeText = value => String(value == null ? '' : value).replace(/\r\n?/g, '\n')
+    .split('\n').map(line => line.trim().replace(/[\t \u00a0]+/g, ' ')).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  const firstLineTitle = text => (normalizeText(text).split('\n').find(line => line.trim()) || '').split(/\s+/).slice(0, 10).join(' ');
+  function queryAll(root, selector) {
+    try { return root ? Array.from(root.querySelectorAll(selector)) : []; } catch (_) { return []; }
+  }
+  function matchesSelector(element, selector) {
+    try { return element.matches(selector); } catch (_) { return false; }
+  }
+  function visibleContent(element) {
+    for (let node = element; node && node.nodeType === 1; node = node.parentElement) {
+      if (node.matches('[hidden], [inert], [aria-hidden="true"]')) return false;
+      const style = window.getComputedStyle(node);
+      if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || style.opacity === '0') return false;
+    }
+    return !!element;
+  }
+  function userRemoved(element) {
+    return (window.wteRemoveSelectors || []).some(selector => {
+      if (selector.startsWith('TEXT:')) {
+        const text = selector.slice(5).trim();
+        return !!text && Array.from(element.childNodes).some(node => node.nodeType === 3 && node.nodeValue.trim() === text);
+      }
+      return matchesSelector(element, selector);
+    });
+  }
+  // Read live text without temporary attributes, innerHTML hashes or observers:
+  // highlight classes, IDs and harmless wrapper rerenders cannot reset stability.
+  function readContentText(element, options = {}) {
+    function walk(node) {
+      if (node.nodeType === 3) return node.nodeValue.replace(/\s+/g, ' ');
+      if (node.nodeType !== 1 || !visibleContent(node) || userRemoved(node) || node.matches(contentNoise)) return '';
+      const tag = node.tagName.toLowerCase();
+      if (options.signature && (node.matches('header, h1, h2, h3, h4, h5, h6, [role="heading"]'))) return '';
+      if (tag === 'br') return '\n';
+      const text = Array.from(node.childNodes).map(walk).join('');
+      return /^(p|div|section|article|main|li|blockquote|pre|h[1-6])$/.test(tag) ? '\n' + text + '\n' : text;
+    }
+    return normalizeText(element ? walk(element) : '');
+  }
+  function siteContext() {
+    const adapter = siteAdapters.find(entry => entry.matches(window.location.hostname)) || genericAdapter;
+    const context = { document, window, adapter, root: null, url: window.location.href, readText: readContentText };
+    if (adapter.getRoot) context.root = adapter.getRoot(context);
+    else {
+      for (const selector of adapter.rootSelectors || []) {
+        context.root = queryAll(document, selector).find(visibleContent) || null;
+        if (context.root) break;
+      }
+    }
+    if (!context.root && adapter === genericAdapter) context.root = document.body;
+    return context;
+  }
+  function chapterTitle(context) {
+    if (context.adapter.getTitle) return normalizeText(context.adapter.getTitle(context));
+    for (const selector of context.adapter.titleSelectors || ['h1', 'h2', '[role="heading"]']) {
+      const title = queryAll(context.root, selector).map(el => readContentText(el)).find(Boolean);
+      if (title) return title;
+    }
+    return '';
+  }
+  function textSignature(text) {
+    // FNV-1a over normalized chapter text; URL deliberately is not part of it.
+    let hash = 2166136261;
+    for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
+    return text ? 'v1:' + text.length + ':' + (hash >>> 0).toString(16) : '';
+  }
   return {
     apiVersion: 1,
+    pollPage: function (options = {}) {
+      if (options.extraction) this.configureExtraction(options.extraction);
+      const { previous = null, reset = false } = options;
+      const key = previous ? JSON.stringify([previous.url, previous.signature]) : '';
+      if ((reset && !resetHeld) || key !== previousKey) stableSignature = null;
+      resetHeld = !!reset;
+      previousKey = key;
+      const context = siteContext();
+      const ready = visibleContent(context.root) && (!context.adapter.isReady || context.adapter.isReady(context));
+      const body = ready ? normalizeText(context.adapter.getSignatureText
+        ? context.adapter.getSignatureText(context) : readContentText(context.root, { signature: true })).replace(/\s+/g, ' ') : '';
+      const signature = textSignature(body);
+      const now = Date.now();
+      if (!signature || signature !== stableSignature) {
+        stableSignature = signature;
+        stableSince = now;
+      }
+      return JSON.stringify({
+        status: signature && now - stableSince >= 800 && (!previous || signature !== previous.signature) ? 'ready' : 'waiting',
+        snapshot: { url: context.url, signature },
+        title: chapterTitle(context) || firstLineTitle(body),
+      });
+    },
+    getChapterContent: function (options = {}) {
+      const { rawText = null, blocks = null } = options;
+      const context = siteContext();
+      const selected = (blocks == null ? JSON.parse(this.getSelectedBlocks()) : blocks)
+        .filter(block => block.selected !== false && normalizeText(block.text));
+      let text = rawText == null ? selected.map((block, index) => {
+        const list = block.type === 'listItem' || block.type === 'li';
+        return (index ? (list ? '\n' : '\n\n') : '') + (list ? '• ' : '') + normalizeText(block.text);
+      }).join('') : /^(null|undefined)$/.test(normalizeText(rawText)) ? '' : normalizeText(rawText);
+      if (context.adapter.format) text = context.adapter.format({ ...context, blocks: selected, rawText, text });
+      text = normalizeText(text);
+      const heading = rawText == null && selected.find(block => block.type === 'heading' || /^h[1-6]$/.test(block.type));
+      const title = !text ? '' : rawText != null ? firstLineTitle(text)
+        : (heading && normalizeText(heading.text)) || (blocks == null && chapterTitle(context)) || firstLineTitle(text);
+      return JSON.stringify({ text, title, url: context.url });
+    },
+    configureExtraction: function ({ removeSelectors = [], automation = false } = {}) {
+      window.wteRemoveSelectors = Array.isArray(removeSelectors) ? removeSelectors.filter(s => typeof s === 'string') : [];
+      extractionOptions = { automation: automation === true };
+    },
+    toggleAll: function (selected) {
+      if (window.wteToggleAll) window.wteToggleAll(!!selected);
+    },
     extractAndHighlight: function () {
       return (function() {
         console.log("WTE: Starting extraction and highlighting...");
@@ -244,8 +395,9 @@
         // ── PHASE 3: EXTRACTION ───────────────────────────────────────────────────────
 
         function runExtraction() {
+          const context = siteContext();
           const bodyText = (document.body.innerText || '').trim();
-          if (bodyText.length < 100) {
+          if (!bodyText) {
             console.log("WTE: body too short, deferring to MutationObserver");
             return false; // SPA not ready
           }
@@ -324,16 +476,25 @@
           }
 
           // Query all potential text elements
-          const elements = document.body.querySelectorAll(
-            'h1, h2, h3, h4, h5, h6, p, li, pre, blockquote, td, div, span, section'
-          );
+          const customBlocks = context.adapter.getBlocks ? context.adapter.getBlocks(context) : null;
+          const customByElement = new Map((customBlocks || []).map(block => [block.element, block]));
+          const tags = 'h1, h2, h3, h4, h5, h6, p, li, pre, blockquote, td, div, span, section';
+          const scope = extractionOptions.automation && context.adapter !== genericAdapter
+            ? context.root : document.body;
+          let elements = customBlocks ? [...customByElement.keys()]
+            : scope ? [scope, ...scope.querySelectorAll(tags)] : [];
+          // Explicit user whitelist may include a heading outside the site's root.
+          for (const selector of window.wteWhitelist || []) elements.push(...queryAll(document, selector));
+          elements = [...new Set(elements)].filter(el => el && el.isConnected).sort((a, b) =>
+            a === b ? 0 : a.compareDocumentPosition(b) & 2 ? 1 : -1);
 
           elements.forEach(el => {
-            if (isLeafTextElement(el)) {
+            if (customByElement.has(el) || isLeafTextElement(el)) {
               if (!isChildOfAlreadyExtracted(el)) {
                 extractedElements.push(el);
 
-                const text = getCleanText(el);
+                const custom = customByElement.get(el);
+                const text = custom ? normalizeText(custom.text) : getCleanText(el);
                 const tag = el.tagName.toLowerCase();
 
                 let type = 'paragraph';
@@ -344,6 +505,7 @@
                 } else if (tag === 'blockquote') {
                   type = 'quote';
                 }
+                if (custom && custom.type) type = custom.type;
 
                 el.setAttribute('data-wte-id', `wte-${blockId}`);
                 allBlocks.push({
@@ -353,7 +515,9 @@
                   element: el,
                   domPath: captureBlockPath(el),
                   score: 1.0,
-                  selected: false // All elements are unselected (red) by default
+                  selected: !!(extractionOptions.automation && context.root &&
+                    context.root.contains(el) && context.adapter.autoSelect &&
+                    context.adapter.autoSelect({ element: el, text, type }, context))
                 });
               }
             }
@@ -660,7 +824,7 @@
           observeBlocks();
 
           const result = {
-            title:  document.title || '',
+            title:  chapterTitle(context) || document.title || '',
             url:    window.location.href,
             blocks: allBlocks.map(b => ({
               id:       b.id,
@@ -1088,6 +1252,16 @@
               if (candidates.length === 1) target = candidates[0];
             }
           }
+        }
+        if (!target && !selector && !savedText) {
+          const context = siteContext();
+          const candidates = context.adapter.getNext
+            ? context.adapter.getNext(context)
+            : (context.adapter.nextSelectors || []).flatMap(value => queryTargets(value));
+          const usable = [...new Set(candidates.map(asControl))].filter(isUsable);
+          // Two unrelated forward destinations are ambiguous, never guess.
+          if (usable.length === 1) target = usable[0];
+          else if (usable.length > 1 && usable.every(el => el.tagName === 'A' && el.href === usable[0].href)) target = usable[0];
         }
         if (target) {
           // Native click handles router listeners and normal links without scrolling
