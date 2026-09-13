@@ -161,6 +161,8 @@
 
         // ── PHASE 1: CLEANUP ────────────────────────────────────────────────────────
 
+        clearTimeout(window.wteExtractionTimer);
+        delete window.wteExtractionTimer;
         if (window.wteStopBlockObserver) {
           window.wteStopBlockObserver();
           delete window.wteStopBlockObserver;
@@ -851,14 +853,14 @@
         const immediateResult = runExtraction();
         if (immediateResult === false) {
           console.log("WTE: DOM not ready — installing MutationObserver");
-          let stableTimer = null;
           const startTime = Date.now();
 
           window._wteObserver = new MutationObserver(() => {
-            if (stableTimer) clearTimeout(stableTimer);
+            clearTimeout(window.wteExtractionTimer);
             const elapsed = Date.now() - startTime;
             const wait = elapsed > MAX_WAIT_MS ? 0 : STABLE_MS;
-            stableTimer = setTimeout(() => {
+            window.wteExtractionTimer = setTimeout(() => {
+              delete window.wteExtractionTimer;
               if (window._wteObserver) { window._wteObserver.disconnect(); delete window._wteObserver; }
               const r = runExtraction();
               if (r === false) {
@@ -939,6 +941,8 @@
     },
     cleanup: function () {
       return (function() {
+        clearTimeout(window.wteExtractionTimer);
+        delete window.wteExtractionTimer;
         if (window.wteStopBlockObserver) {
           window.wteStopBlockObserver();
           delete window.wteStopBlockObserver;
